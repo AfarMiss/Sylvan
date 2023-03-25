@@ -63,7 +63,7 @@ partial class CsvDataReader
 		return this.InitializeReaderAsync().GetAwaiter().GetResult();
 	}
 
-	bool NextRecord()
+	bool NextRecord(char? split = null)
 	{
 		this.curFieldCount = 0;
 		this.recordStart = this.idx;
@@ -97,18 +97,7 @@ partial class CsvDataReader
 		int fieldIdx = 0;
 		while (true)
 		{
-
-
-#if INTRINSICS
-
-			if (ReadRecordFast(ref fieldIdx))
-			{
-				return true;
-			}
-
-#endif
-
-			result = ReadField(fieldIdx);
+			result = ReadField(fieldIdx, split);
 
 			if (result == ReadResult.True)
 			{
@@ -163,12 +152,12 @@ partial class CsvDataReader
 	}
 
 	/// <inheritdoc/>
-	public override bool Read()
+	public bool Read(char? split = null)
 	{
 		this.rowNumber++;
 		if (this.state == State.Open)
 		{
-			var success = this.NextRecord();
+			var success = this.NextRecord(split);
 			if (!success || (this.resultSetMode == ResultSetMode.MultiResult && this.curFieldCount != this.fieldCount))
 			{
 				this.curFieldCount = 0;
@@ -195,6 +184,42 @@ partial class CsvDataReader
 		}
 		this.rowNumber = -1;
 		return false;
+	}
+
+	/// <inheritdoc/>
+	public override bool Read()
+	{
+		return Read(null);
+		//this.rowNumber++;
+		//if (this.state == State.Open)
+		//{
+		//	var success = this.NextRecord();
+		//	if (!success || (this.resultSetMode == ResultSetMode.MultiResult && this.curFieldCount != this.fieldCount))
+		//	{
+		//		this.curFieldCount = 0;
+		//		this.idx = recordStart;
+		//		this.state = State.End;
+		//		this.rowNumber = -1;
+		//		return false;
+		//	}
+		//	return success;
+		//}
+		//else if (this.state == State.Initialized)
+		//{
+		//	// after initizialization, the first record would already be in the buffer
+		//	// if hasRows is true.
+		//	if (hasRows)
+		//	{
+		//		this.state = State.Open;
+		//		return true;
+		//	}
+		//	else
+		//	{
+		//		this.state = State.End;
+		//	}
+		//}
+		//this.rowNumber = -1;
+		//return false;
 	}
 
 	/// <inheritdoc/>

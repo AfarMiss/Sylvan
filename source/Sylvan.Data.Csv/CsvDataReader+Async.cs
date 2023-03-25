@@ -107,10 +107,6 @@ partial class CsvDataReader
 		this.minSafe = delimiter < '\r' ? '\r' : delimiter;
 		this.minSafe = minSafe > quote ? minSafe : quote;
 
-#if INTRINSICS
-		InitIntrinsics();
-#endif
-
 		// if the user specified that there are headers
 		// read them, and use them to determine fieldCount.
 		if (hasHeaders)
@@ -151,7 +147,7 @@ partial class CsvDataReader
 		return true;
 	}
 
-	async Task<bool> NextRecordAsync(CancellationToken cancel = default)
+	async Task<bool> NextRecordAsync(CancellationToken cancel = default, char? split = null)
 	{
 		this.curFieldCount = 0;
 		this.recordStart = this.idx;
@@ -185,15 +181,7 @@ partial class CsvDataReader
 		int fieldIdx = 0;
 		while (true)
 		{
-#if INTRINSICS
-
-			if (ReadRecordFast(ref fieldIdx))
-			{
-				return true;
-			}
-
-#endif
-			result = ReadField(fieldIdx);
+			result = ReadField(fieldIdx, split);
 
 			if (result == ReadResult.True)
 			{
@@ -249,13 +237,19 @@ partial class CsvDataReader
 	}
 
 	/// <inheritdoc/>
-	public override async Task<bool> ReadAsync(CancellationToken cancellationToken)
+	public Task<bool> ReadAsync(char? split = null)
+	{
+		return ReadAsync(CancellationToken.None, split);
+	}
+
+	/// <inheritdoc/>
+	public async Task<bool> ReadAsync(CancellationToken cancellationToken, char? split = null)
 	{
 		cancellationToken.ThrowIfCancellationRequested();
 		this.rowNumber++;
 		if (this.state == State.Open)
 		{
-			var success = await this.NextRecordAsync(cancellationToken).ConfigureAwait(false);
+			var success = await this.NextRecordAsync(cancellationToken, split).ConfigureAwait(false);
 			if (!success || this.resultSetMode == ResultSetMode.MultiResult && this.curFieldCount != this.fieldCount)
 			{
 				this.curFieldCount = 0;
@@ -282,6 +276,12 @@ partial class CsvDataReader
 		}
 		this.rowNumber = -1;
 		return false;
+	}
+
+	/// <inheritdoc/>
+	public override async Task<bool> ReadAsync(CancellationToken cancellationToken)
+	{
+		return await ReadAsync(null).ConfigureAwait(false);
 	}
 
 	/// <inheritdoc/>

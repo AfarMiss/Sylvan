@@ -13,11 +13,6 @@ using System.Text;
 using System.Threading;
 using System.Threading.Tasks;
 
-#if INTRINSICS
-using System.Runtime.Intrinsics;
-using System.Runtime.Intrinsics.X86;
-#endif
-
 namespace Sylvan.Data.Csv;
 
 /// <summary>
@@ -270,170 +265,6 @@ public sealed partial class CsvDataReader : DbDataReader, IDbColumnSchemaGenerat
 		this.state = hasHeaders ? State.Open : State.Initialized;
 	}
 
-#if INTRINSICS
-
-	Vector128<ushort> delimiterMaskVector;
-	Vector128<ushort> lineEndMaskVector;
-	Vector128<ushort> quoteMaskVector;
-
-	void InitIntrinsics()
-	{
-		delimiterMaskVector = Vector128.Create((ushort)this.delimiter);
-		lineEndMaskVector = Vector128.Create((ushort)'\n');
-		quoteMaskVector = Vector128.Create((ushort)this.quote);
-	}
-
-	// this method uses SIMD instructions to optimistically read records
-	// as fast as possible. To keep things simple, this method stops processing
-	// when quotes are detected and falls back to the slower, more robust single-data
-	// path. Returns true when the end-of-record newline is found, and false when
-	// the record might contain more fields.
-	unsafe bool ReadRecordFast(ref int fieldIdx)
-	{
-		if (!Bmi1.IsSupported || !Sse2.IsSupported)
-		{
-			return false;
-		}
-
-		if (this.style != CsvStyle.Standard)
-		{
-			return false;
-		}
-
-		var pos = idx;
-		// processing 8-char chunks so terminate the
-		// fast loop before we run out of data.
-		var end = this.bufferEnd - 8;
-
-		var recordStart = this.recordStart;
-		var fieldInfos = this.fieldInfos;
-
-		fixed (char* p = buffer)
-		{
-			// SIMD operators support ushort.
-			ushort* ip = (ushort*)p;
-			while (pos < end)
-			{
-				// a single 8-char block filled with delimiters can result in 8 new fields
-				// being required, so make sure we have room for that case ahead of time.
-				if (fieldIdx + 8 >= fieldInfos.Length)
-				{
-					Array.Resize(ref fieldInfos, fieldInfos.Length + 8);
-					this.fieldInfos = fieldInfos;
-				}
-
-				// load the current 8-char block into a SIMD vector 
-				var dataVector = Sse2.LoadVector128(ip + pos);
-
-				// produce vectors indicating where delimiters, line ends '\n' and quotes are.
-				// these vectors will contain 8 ushort elements that are either 0 or ushort.MaxValue
-				// indicating where the characters are detected.
-				var delimiterVector = Sse2.CompareEqual(dataVector, delimiterMaskVector);
-				var lineEndVector = Sse2.CompareEqual(dataVector, lineEndMaskVector);
-				var quoteVector = Sse2.CompareEqual(dataVector, quoteMaskVector);
-
-				// convert the vector into a uint bit field. This bit field will
-				// represent character positions by pairs of set bits (ushort => byte)
-				// "XXXX,XXX" => Vector(0,0,0,0,65535,0,0,0) => 0b00_00_00_00_11_00_00_00
-				var delimiterMask = (uint)Sse2.MoveMask(delimiterVector.AsByte());
-
-				// combine the line end and quote vectors to
-				// check if we need to handle those with a single branch
-				var combined = Sse2.Or(lineEndVector, quoteVector);
-				if (Sse2.MoveMask(combined.AsByte()) != 0)
-				{
-					var lineEndMask = (uint)Sse2.MoveMask(lineEndVector.AsByte());
-					var quoteMask = (uint)Sse2.MoveMask(quoteVector.AsByte());
-
-					// find the locations of the first line end and quotes
-					// these indices need to be divided by two since they are
-					// byte offsets and we want char offsets.
-					var lineEndIdx = (int)Bmi1.TrailingZeroCount(lineEndMask);
-					var quoteIdx = (int)Bmi1.TrailingZeroCount(quoteMask);
-
-					// if the first quote appears before the first EOL
-					// abort the SIMD path and let the single-data path process it
-					if (quoteIdx < lineEndIdx)
-					{
-						this.curFieldCount = fieldIdx;
-						return false;
-					}
-
-					// if a lineEnd is present in this block
-					if (lineEndIdx < 0x20)
-					{
-						// process any delimiters that appear before the line end
-						while (delimiterMask != 0)
-						{
-							var delimiterIdx = (int)Bmi1.TrailingZeroCount(delimiterMask);
-							if (delimiterIdx >= lineEndIdx)
-							{
-								break;
-							}
-
-							var endIdx = pos + (delimiterIdx / 2);
-							SetFieldEnd(ref fieldIdx, endIdx);
-							delimiterMask = ClearCharMask(delimiterMask, delimiterIdx);
-						}
-
-						// then process the line ending
-						{
-							var endIdx = pos + (lineEndIdx / 2);
-							ref var field = ref SetFieldEnd(ref fieldIdx, endIdx);
-							// might need to also remove a preceding '\r'
-							if (p[endIdx - 1] == '\r')
-							{
-								field.endIdx--;
-							}
-						}
-						this.curFieldCount = fieldIdx;
-						return true;
-					}
-				}
-
-				// process any delimiters in this block.
-				while (delimiterMask != 0)
-				{
-					var delimiterIdx = (int)Bmi1.TrailingZeroCount(delimiterMask);
-					int endIdx = pos + (delimiterIdx / 2);
-					SetFieldEnd(ref fieldIdx, endIdx);
-					delimiterMask = ClearCharMask(delimiterMask, delimiterIdx);
-				}
-
-				pos += 8;
-			}
-
-			this.curFieldCount = fieldIdx;
-			return false;
-		}
-	}
-
-	[MethodImpl(MethodImplOptions.AggressiveInlining)]
-	ref FieldInfo SetFieldEnd(ref int fieldIdx, int endIdx)
-	{
-		this.idx = endIdx + 1;
-		ref var field = ref fieldInfos[fieldIdx++];
-		field = default;
-		field.endIdx = endIdx - recordStart;
-		return ref field;
-	}
-
-	[MethodImpl(MethodImplOptions.AggressiveInlining)]
-	static uint ClearCharMask(uint value, int idx)
-	{
-		// clears the bits in value below idx + 2.
-		// this is used to clear the two bits that represent
-		// the current delimiter being processed
-		// Example: idx = 4
-		// 1 << (4+2)    == 0b1000000
-		// 0b1000000 - 1 == 0b111111
-		// ~0b111111     == 0b11111111000000
-		var mask = (uint)~((1 << (idx + 2)) - 1);
-		return value & mask;
-	}
-
-#endif
-
 	bool GrowBuffer()
 	{
 		var len = buffer.Length;
@@ -456,7 +287,7 @@ public sealed partial class CsvDataReader : DbDataReader, IDbColumnSchemaGenerat
 	// returns True if there are more in record (hit delimiter), 
 	// False if last in record (hit eol/eof), 
 	// or Incomplete if we exhausted the buffer before finding the end of the record.
-	ReadResult ReadField(int fieldIdx)
+	ReadResult ReadField(int fieldIdx, char? split = null)
 	{
 		char c;
 		var idx = this.idx;
@@ -503,7 +334,9 @@ public sealed partial class CsvDataReader : DbDataReader, IDbColumnSchemaGenerat
 						return ReadResult.Incomplete;
 					}
 				}
-				if (c == delimiter || IsEndOfLine(c))
+
+				if (split == null) split = delimiter;
+				if (c == split || IsEndOfLine(c))
 				{
 					// "unread" the delimiter/eol, and let the normal code path handle it
 					idx--;
